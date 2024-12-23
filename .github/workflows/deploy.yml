@@ -1,0 +1,47 @@
+name: Deploy Application
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout the code
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # 2. Package the repository
+      - name: Package application
+        run: |
+          tar -czf app_$(date +%Y%m%d).tar.gz .
+
+      # 3. Upload to S3
+      - name: Upload to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 cp app_$(date +%Y%m%d).tar.gz s3://omar-app-bucket/
+
+      # 4. Deploy to EC2
+      - name: Deploy to EC2
+        run: |
+          aws s3 cp s3://omar-app-bucket/app_$(date +%Y%m%d).tar.gz /tmp/app.tar.gz
+          tar -xzf /tmp/app.tar.gz -C /var/www/html
+
+      # 5. Cleanup old builds
+      - name: Cleanup old builds
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 ls s3://omar-app-bucket/ | awk '{print $4}' | while read file; do
+            creation_date=$(aws s3api head-object --bucket omar-app-bucket --key $file --query "LastModified" --output text)
+            if [[ $(date -d "$creation_date" +%s) -lt $(date -d "7 days ago" +%s) ]]; then
+              aws s3 rm s3://omar-app-bucket/$file
+            fi
+          done
