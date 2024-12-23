@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout the code
+      # 1. Checkout the repository
       - name: Checkout code
         uses: actions/checkout@v3
 
@@ -21,7 +21,7 @@ jobs:
           cp -R . /tmp/app_package
           tar --exclude='/tmp/app_package/.git' -czf app_$(date +%Y%m%d).tar.gz -C /tmp/app_package .
 
-      # 3. Upload to S3
+      # 3. Upload the package to S3
       - name: Upload to S3
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -29,22 +29,7 @@ jobs:
         run: |
           aws s3 cp app_$(date +%Y%m%d).tar.gz s3://omar-app-bucket/
 
-      # 4. Setup Apache on EC2
-      - name: Setup Apache on EC2
-        run: |
-          echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/tet.pem
-          chmod 400 /tmp/tet.pem
-          ssh -i /tmp/tet.pem -o StrictHostKeyChecking=no ec2-user@3.94.131.73 \
-          "sudo yum install httpd -y && sudo systemctl enable httpd && sudo systemctl start httpd && sudo mkdir -p /var/www/html && sudo chown ec2-user:ec2-user /var/www/html"
-
-      # 5. Deploy to EC2
-      - name: Deploy to EC2
-        run: |
-          scp -i /tmp/tet.pem -o StrictHostKeyChecking=no app_$(date +%Y%m%d).tar.gz ec2-user@3.94.131.73:/tmp/
-          ssh -i /tmp/tet.pem -o StrictHostKeyChecking=no ec2-user@3.94.131.73 \
-          "sudo tar -xzf /tmp/app_$(date +%Y%m%d).tar.gz -C /var/www/html && sudo systemctl restart httpd"
-
-      # 6. Cleanup old builds
+      # 4. Cleanup old builds from S3
       - name: Cleanup old builds
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
