@@ -17,7 +17,7 @@ jobs:
       # 2. Package the repository
       - name: Package application
         run: |
-          tar -czf app_$(date +%Y%m%d).tar.gz .
+          tar --exclude='.git' -czf app_$(date +%Y%m%d).tar.gz .
 
       # 3. Upload to S3
       - name: Upload to S3
@@ -29,9 +29,14 @@ jobs:
 
       # 4. Deploy to EC2
       - name: Deploy to EC2
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
         run: |
-          aws s3 cp s3://omar-app-bucket/app_$(date +%Y%m%d).tar.gz /tmp/app.tar.gz
-          tar -xzf /tmp/app.tar.gz -C /var/www/html
+          echo "${EC2_SSH_KEY}" > /tmp/tet.pem
+          chmod 400 /tmp/tet.pem
+          scp -i /tmp/tet.pem -o StrictHostKeyChecking=no app_$(date +%Y%m%d).tar.gz ec2-user@3.94.131.73:/tmp/
+          ssh -i /tmp/tet.pem -o StrictHostKeyChecking=no ec2-user@3.94.131.73 \
+          "sudo tar -xzf /tmp/app_$(date +%Y%m%d).tar.gz -C /var/www/html && sudo systemctl restart httpd"
 
       # 5. Cleanup old builds
       - name: Cleanup old builds
