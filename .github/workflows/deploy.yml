@@ -27,17 +27,40 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          aws s3 cp app_$(date +%Y%m%d).tar.gz s3://omar-app-bucket/
+          aws s3 cp app_$(date +%Y%m%d).tar.gz s3://omar-app-private-bucket/
 
-      # 4. Cleanup old builds from S3
-      - name: Cleanup old builds
+      # 4. Update ASG instances with the new package
+      - name: Deploy to ASG
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          aws s3 ls s3://omar-app-bucket/ | awk '{print $4}' | while read file; do
-            creation_date=$(aws s3api head-object --bucket omar-app-bucket --key $file --query "LastModified" --output text)
-            if [[ $(date -d "$creation_date" +%s) -lt $(date -d "7 days ago" +%s) ]]; then
-              aws s3 rm s3://omar-app-bucket/$file
-            fi
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-name omar-alb \
+            --query "AutoScalingGroups[0].Instances[].InstanceId" --output text)
+
+          for INSTANCE_ID in $INSTANCE_IDS; do
+            PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+              --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+
+            echo "Deploying to instance $INSTANCE_ID with IP $PUBLIC_IP"
+
+            ssh -i /path/to/key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP \
+            "aws s3 cp s3://omar-app-private-bucket/app_$(date +%Y%m%d).tar.gz /tmp/ && \
+            sudo tar -xzf /tmp/app_$(date +%Y%m%d).tar.gz -C /var/www/html && \
+            sudo systemctl restart httpd"
+          done
+
+      # 5. Verify deployment
+      - name: Verify application
+        run: |
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-name omar-alb \
+            --query "AutoScalingGroups[0].Instances[].InstanceId" --output text)
+
+          for INSTANCE_ID in $INSTANCE_IDS; do
+            PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+              --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+
+            curl -s http://$PUBLIC_IP/index.php | grep "Welcome to WordPress" || exit 1
           done
