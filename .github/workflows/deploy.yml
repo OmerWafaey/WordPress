@@ -1,62 +1,85 @@
-name: Deploy Application
+name: Deploy Workflow
 
 on:
+  workflow_dispatch: {}
   push:
     branches:
       - master
 
+env:
+  AWS_REGION: us-east-1
+  PUBLIC_S3_BUCKET: omar-app-bucket
+  PRIVATE_S3_BUCKET: omar-app-private-bucket
+
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
-  build-and-deploy:
+  build:
+    runs-on: ubuntu-latest
+
+    outputs:
+      s3object: ${{ steps.object.outputs.s3object }}
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-region: ${{ env.AWS_REGION }}
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+        role-session-name: GitHub_to_AWS_via_FederatedOIDC
+
+    - name: Package and Upload App to Public S3
+      id: object
+      run: |
+        DATE=$(date +%Y%m%d)
+        s3object="app_${DATE}.tar.gz"
+        echo "S3 Object: $s3object"
+        echo "s3object=$s3object" >> $GITHUB_OUTPUT
+        git archive --format=tar.gz --output=${s3object} HEAD
+        mkdir -p archive
+        mv ${s3object} archive/
+        aws s3 cp archive/${s3object} s3://${{ env.PUBLIC_S3_BUCKET }}/${s3object}
+
+    - name: Set Expiry Policy on Public S3
+      run: |
+        aws s3api put-bucket-lifecycle-configuration --bucket ${{ env.PUBLIC_S3_BUCKET }} --lifecycle-configuration '{"Rules":[{"ID":"DeleteObjectsAfter7Days","Prefix":"","Status":"Enabled","Expiration":{"Days":7}}]}'
+
+  deploy:
+    needs: build
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-region: ${{ env.AWS_REGION }}
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+        role-session-name: GitHub_to_AWS_via_FederatedOIDC
 
-      - name: Package application
-        run: |
-          mkdir -p /tmp/app_package
-          cp -R . /tmp/app_package
-          tar --exclude='/tmp/app_package/.git' -czf app_$(date +%Y%m%d).tar.gz -C /tmp/app_package .
+    - name: Deploy to Auto Scaling Group
+      env:
+        PRIVATE_KEY: ${{ secrets.PRIVATE_KEY_PEM }}
+      run: |
+        echo "${{ env.PRIVATE_KEY }}" > /tmp/key.pem
+        chmod 600 /tmp/key.pem
 
-      - name: Upload to S3
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: |
-          aws s3 cp app_$(date +%Y%m%d).tar.gz s3://omar-app-bucket/ --region us-east-1
+        INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+          --auto-scaling-group-name omar-alb \
+          --query "AutoScalingGroups[0].Instances[].InstanceId" --output text --region ${{ env.AWS_REGION }})
 
-      - name: Fetch wp-config.php
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: |
-          aws s3 cp s3://omar-app-private-bucket/wp-config.php /tmp/wp-config.php --region us-east-1
+        for INSTANCE_ID in $INSTANCE_IDS; do
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+            --query "Reservations[0].Instances[0].PublicIpAddress" --output text --region ${{ env.AWS_REGION }})
 
-      - name: Deploy application to ASG
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-        run: |
-          echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/key.pem
-          chmod 600 /tmp/key.pem
+          echo "Deploying to instance $INSTANCE_ID with IP $PUBLIC_IP"
 
-          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
-            --auto-scaling-group-name omar-alb \
-            --query "AutoScalingGroups[0].Instances[].InstanceId" --output text --region us-east-1)
-
-          for INSTANCE_ID in $INSTANCE_IDS; do
-            PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
-              --query "Reservations[0].Instances[0].PublicIpAddress" --output text --region us-east-1)
-
-            echo "Deploying to instance $INSTANCE_ID with IP $PUBLIC_IP"
-
-            scp -i /tmp/key.pem -o StrictHostKeyChecking=no /tmp/app_$(date +%Y%m%d).tar.gz ec2-user@$PUBLIC_IP:/tmp/
-            scp -i /tmp/key.pem -o StrictHostKeyChecking=no /tmp/wp-config.php ec2-user@$PUBLIC_IP:/tmp/
-
-            ssh -i /tmp/key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP \
-            "sudo tar -xzf /tmp/app_$(date +%Y%m%d).tar.gz -C /var/www/html && \
-             sudo mv /tmp/wp-config.php /var/www/html/wp-config.php && \
-             sudo systemctl restart httpd"
-          done
+          ssh -i /tmp/key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP \
+          "aws s3 cp s3://${{ env.PUBLIC_S3_BUCKET }}/${{ needs.build.outputs.s3object }} /tmp/ && \
+          aws s3 cp s3://${{ env.PRIVATE_S3_BUCKET }}/wp-config.php /tmp/ && \
+          sudo tar -xzf /tmp/${{ needs.build.outputs.s3object }} -C /var/www/html && \
+          sudo mv /tmp/wp-config.php /var/www/html/wp-config.php && \
+          sudo systemctl restart httpd"
+        done
