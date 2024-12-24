@@ -1,7 +1,7 @@
-name: Deploy Workflow
+name: Deploy WordPress Application
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   push:
     branches:
       - master
@@ -19,6 +19,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    outputs:
+      s3object: ${{ steps.object.outputs.s3object }}
+
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v4
@@ -26,22 +29,22 @@ jobs:
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
-        role-to-assume: arn:aws:iam::577638394586:role/GitHubActionsRole
         aws-region: ${{ env.AWS_REGION }}
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
         role-session-name: GitHub_to_AWS_via_FederatedOIDC
 
-    - name: Package Repository and Upload to S3
+    - name: Package Repo and Upload to Public S3
+      id: object
       run: |
         DATE=$(date +%Y%m%d)
-        S3_OBJECT="app_${DATE}.tar.gz"
-        echo "Packaging repository..."
-        tar --exclude='./.git' --exclude='./.github' -czf ${S3_OBJECT} .
-        echo "Uploading ${S3_OBJECT} to S3 bucket ${PUBLIC_S3_BUCKET}..."
-        aws s3 cp ${S3_OBJECT} s3://${{ env.PUBLIC_S3_BUCKET }}/${S3_OBJECT}
+        s3object=$(echo "app_${DATE}.tar.gz")
+        echo "S3 Object: $s3object"
+        echo "s3object=$s3object" >> $GITHUB_OUTPUT
+        tar -czf ${s3object} .
+        aws s3 cp ${s3object} s3://${{ env.PUBLIC_S3_BUCKET }}/${s3object}
 
-    - name: Set Expiry Policy for S3
+    - name: Apply Expiry Policy to Public S3 Bucket
       run: |
-        echo "Setting expiry policy for S3 bucket ${PUBLIC_S3_BUCKET}..."
         aws s3api put-bucket-lifecycle-configuration --bucket ${{ env.PUBLIC_S3_BUCKET }} --lifecycle-configuration '{"Rules":[{"ID":"DeleteObjectsAfter7Days","Prefix":"","Status":"Enabled","Expiration":{"Days":7}}]}'
 
   deploy:
@@ -52,32 +55,32 @@ jobs:
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
-        role-to-assume: arn:aws:iam::577638394586:role/GitHubActionsRole
         aws-region: ${{ env.AWS_REGION }}
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
         role-session-name: GitHub_to_AWS_via_FederatedOIDC
 
     - name: Deploy to Auto Scaling Group
+      env:
+        PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+        S3_OBJECT: ${{ needs.build.outputs.s3object }}
       run: |
-        echo "Fetching instances from Auto Scaling Group..."
+        echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/key.pem
+        chmod 600 /tmp/key.pem
+
         INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
           --auto-scaling-group-name omar-alb \
-          --query "AutoScalingGroups[0].Instances[].InstanceId" \
-          --output text --region ${{ env.AWS_REGION }})
+          --query "AutoScalingGroups[0].Instances[].InstanceId" --output text --region ${{ env.AWS_REGION }})
 
-        echo "Deploying to instances..."
         for INSTANCE_ID in $INSTANCE_IDS; do
-          PUBLIC_IP=$(aws ec2 describe-instances \
-            --instance-ids $INSTANCE_ID \
-            --query "Reservations[0].Instances[0].PublicIpAddress" \
-            --output text --region ${{ env.AWS_REGION }})
-          
-          echo "Deploying to instance $INSTANCE_ID with IP $PUBLIC_IP..."
-          ssh-keyscan -H $PUBLIC_IP >> ~/.ssh/known_hosts
-          scp -i /tmp/key.pem -o StrictHostKeyChecking=no /tmp/app_$(date +%Y%m%d).tar.gz ec2-user@$PUBLIC_IP:/tmp/
-          scp -i /tmp/key.pem -o StrictHostKeyChecking=no /tmp/wp-config.php ec2-user@$PUBLIC_IP:/tmp/
-          
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+            --query "Reservations[0].Instances[0].PublicIpAddress" --output text --region ${{ env.AWS_REGION }})
+
+          echo "Deploying to instance $INSTANCE_ID with IP $PUBLIC_IP"
+
           ssh -i /tmp/key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP \
-          "sudo tar -xzf /tmp/app_$(date +%Y%m%d).tar.gz -C /var/www/html && \
+          "aws s3 cp s3://${{ env.PUBLIC_S3_BUCKET }}/${S3_OBJECT} /tmp/ && \
+           sudo tar -xzf /tmp/${S3_OBJECT} -C /var/www/html && \
+           aws s3 cp s3://${{ env.PRIVATE_S3_BUCKET }}/wp-config.php /tmp/wp-config.php && \
            sudo mv /tmp/wp-config.php /var/www/html/wp-config.php && \
            sudo systemctl restart httpd"
         done
