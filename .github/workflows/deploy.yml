@@ -1,7 +1,6 @@
-name: Deploy WordPress Application
+name: Deploy WordPress
 
 on:
-  workflow_dispatch: {}
   push:
     branches:
       - master
@@ -10,17 +9,16 @@ env:
   AWS_REGION: us-east-1
   PUBLIC_S3_BUCKET: omar-app-bucket
   PRIVATE_S3_BUCKET: omar-app-private-bucket
+  ASG_NAME: omar-alb
 
 permissions:
   id-token: write
   contents: read
 
 jobs:
-  build:
+  build-and-upload:
+    name: Build and Upload WordPress
     runs-on: ubuntu-latest
-
-    outputs:
-      s3object: ${{ steps.object.outputs.s3object }}
 
     steps:
     - name: Checkout Repository
@@ -31,24 +29,30 @@ jobs:
       with:
         aws-region: ${{ env.AWS_REGION }}
         role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-        role-session-name: GitHub_to_AWS_via_FederatedOIDC
+        role-session-name: GitHubOIDCSession
 
-    - name: Package Repo and Upload to Public S3
-      id: object
+    - name: Package WordPress Application
       run: |
         DATE=$(date +%Y%m%d)
-        s3object=$(echo "app_${DATE}.tar.gz")
-        echo "S3 Object: $s3object"
-        echo "s3object=$s3object" >> $GITHUB_OUTPUT
-        tar -czf ${s3object} .
-        aws s3 cp ${s3object} s3://${{ env.PUBLIC_S3_BUCKET }}/${s3object}
+        tar -czf app_$DATE.tar.gz .
+        mkdir -p archive
+        mv app_$DATE.tar.gz archive/
 
-    - name: Apply Expiry Policy to Public S3 Bucket
+    - name: Upload to Public S3 Bucket
       run: |
-        aws s3api put-bucket-lifecycle-configuration --bucket ${{ env.PUBLIC_S3_BUCKET }} --lifecycle-configuration '{"Rules":[{"ID":"DeleteObjectsAfter7Days","Prefix":"","Status":"Enabled","Expiration":{"Days":7}}]}'
+        aws s3 cp archive/app_$(date +%Y%m%d).tar.gz s3://${{ env.PUBLIC_S3_BUCKET }}/
+
+    - name: Upload wp-config.php to Private S3 Bucket
+      run: |
+        aws s3 cp wp-config.php s3://${{ env.PRIVATE_S3_BUCKET }}/wp-config.php
+
+    - name: Set S3 Expiry Policy
+      run: |
+        aws s3api put-bucket-lifecycle-configuration --bucket ${{ env.PUBLIC_S3_BUCKET }} --lifecycle-configuration '{"Rules":[{"ID":"ExpireOldBuilds","Status":"Enabled","Expiration":{"Days":7}}]}'
 
   deploy:
-    needs: build
+    name: Deploy Application
+    needs: build-and-upload
     runs-on: ubuntu-latest
 
     steps:
@@ -57,30 +61,33 @@ jobs:
       with:
         aws-region: ${{ env.AWS_REGION }}
         role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-        role-session-name: GitHub_to_AWS_via_FederatedOIDC
+        role-session-name: GitHubOIDCSession
 
     - name: Deploy to Auto Scaling Group
-      env:
-        PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
-        S3_OBJECT: ${{ needs.build.outputs.s3object }}
       run: |
-        echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/key.pem
-        chmod 600 /tmp/key.pem
-
+        # Get all EC2 instances in the ASG
         INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
-          --auto-scaling-group-name omar-alb \
-          --query "AutoScalingGroups[0].Instances[].InstanceId" --output text --region ${{ env.AWS_REGION }})
+          --auto-scaling-group-name ${{ env.ASG_NAME }} \
+          --query "AutoScalingGroups[0].Instances[].InstanceId" \
+          --output text \
+          --region ${{ env.AWS_REGION }})
 
         for INSTANCE_ID in $INSTANCE_IDS; do
+          # Get the public IP of the instance
           PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
-            --query "Reservations[0].Instances[0].PublicIpAddress" --output text --region ${{ env.AWS_REGION }})
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text \
+            --region ${{ env.AWS_REGION }})
 
           echo "Deploying to instance $INSTANCE_ID with IP $PUBLIC_IP"
 
+          # Download the package and wp-config.php
           ssh -i /tmp/key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP \
-          "aws s3 cp s3://${{ env.PUBLIC_S3_BUCKET }}/${S3_OBJECT} /tmp/ && \
-           sudo tar -xzf /tmp/${S3_OBJECT} -C /var/www/html && \
-           aws s3 cp s3://${{ env.PRIVATE_S3_BUCKET }}/wp-config.php /tmp/wp-config.php && \
+          "aws s3 cp s3://${{ env.PUBLIC_S3_BUCKET }}/app_$(date +%Y%m%d).tar.gz /tmp/ && \
+           aws s3 cp s3://${{ env.PRIVATE_S3_BUCKET }}/wp-config.php /tmp/ && \
+           sudo tar -xzf /tmp/app_$(date +%Y%m%d).tar.gz -C /var/www/html && \
            sudo mv /tmp/wp-config.php /var/www/html/wp-config.php && \
+           sudo chown -R apache:apache /var/www/html && \
+           sudo chmod -R 755 /var/www/html && \
            sudo systemctl restart httpd"
         done
