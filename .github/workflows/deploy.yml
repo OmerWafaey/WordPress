@@ -22,12 +22,12 @@ jobs:
           tar --exclude='/tmp/app_package/.git' -czf app_$(date +%Y%m%d).tar.gz -C /tmp/app_package .
 
       # 3. Upload the package to S3 (Public Bucket)
-      - name: Upload to Public S3 Bucket
+      - name: Upload to S3
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          aws s3 cp app_$(date +%Y%m%d).tar.gz s3://omar-app-bucket/
+          aws s3 cp app_$(date +%Y%m%d).tar.gz s3://omar-app-bucket/ --region us-east-1
 
       # 4. Fetch wp-config.php from Private S3 Bucket
       - name: Fetch wp-config.php
@@ -35,39 +35,51 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          aws s3 cp s3://omar-app-private-bucket/wp-config.php /tmp/wp-config.php
+          aws s3 cp s3://omar-app-private-bucket/wp-config.php /tmp/wp-config.php --region us-east-1
 
-      # 5. Deploy to Auto Scaling Group Instances
-      - name: Deploy application to EC2 instances
+      # 5. Deploy to EC2 Instances in Auto Scaling Group
+      - name: Deploy application to ASG
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
           INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
-          --auto-scaling-group-name omar-alb \
-          --query "AutoScalingGroups[0].Instances[].InstanceId" --output text)
-          
+            --auto-scaling-group-name omar-alb \
+            --query "AutoScalingGroups[0].Instances[].InstanceId" --output text --region us-east-1)
+
           for INSTANCE_ID in $INSTANCE_IDS; do
             PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
-              --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
-            
+              --query "Reservations[0].Instances[0].PublicIpAddress" --output text --region us-east-1)
+
             echo "Deploying to instance $INSTANCE_ID with IP $PUBLIC_IP"
-            
+
             scp -i ${{ secrets.EC2_SSH_KEY }} -o StrictHostKeyChecking=no /tmp/app_$(date +%Y%m%d).tar.gz ec2-user@$PUBLIC_IP:/tmp/
             scp -i ${{ secrets.EC2_SSH_KEY }} -o StrictHostKeyChecking=no /tmp/wp-config.php ec2-user@$PUBLIC_IP:/tmp/
-            
+
             ssh -i ${{ secrets.EC2_SSH_KEY }} -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP \
             "sudo tar -xzf /tmp/app_$(date +%Y%m%d).tar.gz -C /var/www/html && \
              sudo mv /tmp/wp-config.php /var/www/html/wp-config.php && \
              sudo systemctl restart httpd"
           done
 
-      # 6. Cleanup old builds from S3
-      - name: Cleanup old builds from S3
+      # 6. Set Expiry Policy for Builds in Public S3 Bucket
+      - name: Set Expiry Policy
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          aws s3api list-objects --bucket omar-app-bucket --query "Contents[?LastModified<='$(date -d '-7 days' --utc +%Y-%m-%dT%H:%M:%SZ)'].[Key]" --output text | while read file; do
-            aws s3 rm s3://omar-app-bucket/$file
-          done
+          aws s3api put-bucket-lifecycle-configuration --bucket omar-app-bucket \
+          --lifecycle-configuration '{
+            "Rules": [
+              {
+                "ID": "ExpireOldBuilds",
+                "Filter": {
+                  "Prefix": ""
+                },
+                "Status": "Enabled",
+                "Expiration": {
+                  "Days": 7
+                }
+              }
+            ]
+          }' --region us-east-1
