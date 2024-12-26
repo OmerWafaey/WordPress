@@ -9,46 +9,41 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     steps:
+    # الخطوة 1: سحب الكود
     - name: Checkout code
       uses: actions/checkout@v3
 
+    # الخطوة 2: ضغط الملفات
     - name: Compress application
-      run: |
-        mkdir -p temp_build
-        rsync -av --exclude='.git' --exclude='.github' ./ temp_build/
-        tar -czf app_$(date +'%Y-%m-%d').tar.gz -C temp_build .
-        rm -rf temp_build
+      run: tar -czf app_$(date +'%Y-%m-%d').tar.gz ./
 
-    - name: Configure AWS credentials for S3
+    # الخطوة 3: رفع الملفات إلى S3 (Public Bucket)
+    - name: Upload application to S3 (Public Bucket)
       uses: aws-actions/configure-aws-credentials@v2
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
-
-    - name: Upload application to S3 (Public Bucket)
       run: |
         aws s3 cp app_$(date +'%Y-%m-%d').tar.gz s3://${{ secrets.S3_BUCKET_PUBLIC }}/
 
-    - name: Configure AWS credentials for ASG
+    # الخطوة 4: تحديث Auto Scaling Group
+    - name: Refresh Auto Scaling Group
       uses: aws-actions/configure-aws-credentials@v2
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
-
-    - name: Refresh Auto Scaling Group
       run: |
         aws autoscaling start-instance-refresh --auto-scaling-group-name ${{ secrets.ASG_NAME }}
 
-    - name: Configure AWS credentials for cleaning S3
+    # الخطوة 5: تنظيف الملفات القديمة في S3 (تجاوزت 7 أيام)
+    - name: Clean old builds from S3
       uses: aws-actions/configure-aws-credentials@v2
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
-
-    - name: Clean old builds from S3
       run: |
         aws s3 ls s3://${{ secrets.S3_BUCKET_PUBLIC }}/ | awk '{print $4}' | while read file; do
           if [[ $file == app_*.tar.gz ]]; then
