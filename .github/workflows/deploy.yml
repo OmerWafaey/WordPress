@@ -31,7 +31,17 @@ jobs:
       run: |
         aws s3 cp app_$(date +'%Y-%m-%d').tar.gz s3://${{ secrets.S3_BUCKET_PUBLIC }}/
 
+    - name: Check for existing Instance Refresh
+      id: check-refresh
+      run: |
+        existing_refresh=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name ${{ secrets.ASG_NAME }} --query 'InstanceRefreshes[?Status==`InProgress`]' --output text)
+        if [ -n "$existing_refresh" ]; then
+          echo "Instance Refresh is already in progress. Exiting."
+          exit 0
+        fi
+
     - name: Refresh Auto Scaling Group
+      if: steps.check-refresh.outcome == 'success'
       run: |
         aws autoscaling start-instance-refresh --auto-scaling-group-name ${{ secrets.ASG_NAME }}
 
