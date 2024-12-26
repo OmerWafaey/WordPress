@@ -15,7 +15,10 @@ jobs:
 
     - name: Compress application
       run: |
-        tar --exclude='./.git' --exclude='./.github' -czf app_$(date +'%Y-%m-%d').tar.gz ./
+        mkdir -p temp_archive
+        cp -r . temp_archive/
+        tar --exclude='./.git' --exclude='./.github' -czf app_$(date +'%Y-%m-%d').tar.gz -C temp_archive .
+        rm -rf temp_archive
 
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
