@@ -10,18 +10,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
     - name: Checkout code
       uses: actions/checkout@v3
 
-    - name: Create temporary directory and copy files
-      run: |
-        mkdir temp_dir
-        rsync -av --exclude=".git" --exclude=".github" ./ temp_dir/
-
     - name: Compress application
       run: |
-        tar -czf app_$(date +'%Y-%m-%d').tar.gz -C temp_dir .
+        tar --exclude='./.git' --exclude='./.github' -czf app_$(date +'%Y-%m-%d').tar.gz ./
 
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
@@ -42,17 +36,16 @@ jobs:
       run: |
         aws s3 ls s3://${{ secrets.S3_BUCKET_PUBLIC }}/ | awk '{print $4}' | while read file; do
           if [[ $file == app_*.tar.gz ]]; then
-            build_date=$(echo $file | sed 's/app_\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).tar.gz/\1/')
-            build_timestamp=$(date -d $build_date +%s)
-            current_timestamp=$(date +%s)
-            diff=$(( (current_timestamp - build_timestamp) / 86400 ))
-            if [[ $diff -gt 7 ]]; then
-              aws s3 rm s3://${{ secrets.S3_BUCKET_PUBLIC }}/$file
+            build_date=$(echo $file | sed -E 's/app_([0-9]{4})([0-9]{2})([0-9]{2}).tar.gz/\1-\2-\3/')
+            if date -d "$build_date" >/dev/null 2>&1; then
+              build_timestamp=$(date -d "$build_date" +%s)
+              current_timestamp=$(date +%s)
+              diff=$(( (current_timestamp - build_timestamp) / 86400 ))
+              if [[ $diff -gt 7 ]]; then
+                aws s3 rm s3://${{ secrets.S3_BUCKET_PUBLIC }}/$file
+              fi
+            else
+              echo "Skipping file with invalid date format: $file"
             fi
           fi
         done
-
-    - name: Clean up temporary files
-      run: |
-        rm -rf temp_dir
-        rm -f app_*.tar.gz
