@@ -10,16 +10,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
+    # Step 1: Checkout the code
     - name: Checkout code
       uses: actions/checkout@v3
 
+    # Step 2: Compress the application
     - name: Compress application
       run: |
-        mkdir -p temp_archive
-        rsync -a --exclude=temp_archive --exclude='.git' --exclude='.github' ./ temp_archive/
+        mkdir temp_archive
+        cp -r $(ls -A | grep -vE '^temp_archive$') temp_archive/
         tar -czf app_$(date +'%Y-%m-%d').tar.gz -C temp_archive .
         rm -rf temp_archive
 
+    # Step 3: Configure AWS credentials
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
       with:
@@ -27,38 +31,32 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
 
+    # Step 4: Upload the application to the S3 public bucket
     - name: Upload application to S3 (Public Bucket)
       run: |
         aws s3 cp app_$(date +'%Y-%m-%d').tar.gz s3://${{ secrets.S3_BUCKET_PUBLIC }}/
 
-    - name: Check for existing Instance Refresh
-      id: check-refresh
+    # Step 5: Refresh the Auto Scaling Group
+    - name: Refresh Auto Scaling Group
       run: |
-        existing_refresh=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name ${{ secrets.ASG_NAME }} --query 'InstanceRefreshes[?Status==`InProgress`]' --output text)
-        if [ -n "$existing_refresh" ]; then
-          echo "Instance Refresh is already in progress. Exiting."
+        REFRESH_STATUS=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name ${{ secrets.ASG_NAME }} | jq -r '.InstanceRefreshes[0].Status // "None"')
+        if [ "$REFRESH_STATUS" == "InProgress" ]; then
+          echo "An Instance Refresh is already in progress. Exiting."
           exit 0
         fi
-
-    - name: Refresh Auto Scaling Group
-      if: steps.check-refresh.outcome == 'success'
-      run: |
         aws autoscaling start-instance-refresh --auto-scaling-group-name ${{ secrets.ASG_NAME }}
 
+    # Step 6: Clean old builds from the S3 public bucket
     - name: Clean old builds from S3
       run: |
         aws s3 ls s3://${{ secrets.S3_BUCKET_PUBLIC }}/ | awk '{print $4}' | while read file; do
           if [[ $file == app_*.tar.gz ]]; then
-            build_date=$(echo $file | sed -E 's/app_([0-9]{4})([0-9]{2})([0-9]{2}).tar.gz/\1-\2-\3/')
-            if date -d "$build_date" >/dev/null 2>&1; then
-              build_timestamp=$(date -d "$build_date" +%s)
-              current_timestamp=$(date +%s)
-              diff=$(( (current_timestamp - build_timestamp) / 86400 ))
-              if [[ $diff -gt 7 ]]; then
-                aws s3 rm s3://${{ secrets.S3_BUCKET_PUBLIC }}/$file
-              fi
-            else
-              echo "Skipping file with invalid date format: $file"
+            build_date=$(echo $file | sed 's/app_\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).tar.gz/\1/')
+            build_timestamp=$(date -d $build_date +%s)
+            current_timestamp=$(date +%s)
+            diff=$(( (current_timestamp - build_timestamp) / 86400 ))
+            if [[ $diff -gt 7 ]]; then
+              aws s3 rm s3://${{ secrets.S3_BUCKET_PUBLIC }}/$file
             fi
           fi
         done
