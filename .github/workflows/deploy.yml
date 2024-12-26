@@ -3,91 +3,51 @@ name: Deploy WordPress
 on:
   push:
     branches:
-      - master
-
-env:
-  AWS_REGION: us-east-1
-  PUBLIC_S3_BUCKET: omar-app-bucket
-  PRIVATE_S3_BUCKET: omar-app-private-bucket
-  ASG_NAME: omar-alb
-
-permissions:
-  id-token: write
-  contents: read
+      - main
 
 jobs:
-  build-and-upload:
-    name: Build and Upload WordPress
+  build-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v3
 
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v4
+    - name: Compress application
+      run: tar -czf app_$(date +'%Y-%m-%d').tar.gz ./
+
+    - name: Upload application to S3 (Public Bucket)
+      uses: aws-actions/configure-aws-credentials@v2
       with:
-        aws-region: ${{ env.AWS_REGION }}
-        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-        role-session-name: GitHubOIDCSession
-
-    - name: Package WordPress Application
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
       run: |
-        DATE=$(date +%Y%m%d)
-        tar -czf app_$DATE.tar.gz .
-        mkdir -p archive
-        mv app_$DATE.tar.gz archive/
+        aws s3 cp app_$(date +'%Y-%m-%d').tar.gz s3://${{ secrets.S3_BUCKET_PUBLIC }}/
 
-    - name: Upload to Public S3 Bucket
-      run: |
-        aws s3 cp archive/app_$(date +%Y%m%d).tar.gz s3://${{ env.PUBLIC_S3_BUCKET }}/
-
-    - name: Upload wp-config.php to Private S3 Bucket
-      run: |
-        aws s3 cp wp-config.php s3://${{ env.PRIVATE_S3_BUCKET }}/wp-config.php
-
-    - name: Set S3 Expiry Policy
-      run: |
-        aws s3api put-bucket-lifecycle-configuration --bucket ${{ env.PUBLIC_S3_BUCKET }} --lifecycle-configuration '{"Rules":[{"ID":"ExpireOldBuilds","Status":"Enabled","Expiration":{"Days":7}}]}'
-
-  deploy:
-    name: Deploy Application
-    needs: build-and-upload
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v4
+    - name: Refresh Auto Scaling Group
+      uses: aws-actions/configure-aws-credentials@v2
       with:
-        aws-region: ${{ env.AWS_REGION }}
-        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-        role-session-name: GitHubOIDCSession
-
-    - name: Deploy to Auto Scaling Group
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
       run: |
-        # Get all EC2 instances in the ASG
-        INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
-          --auto-scaling-group-name ${{ env.ASG_NAME }} \
-          --query "AutoScalingGroups[0].Instances[].InstanceId" \
-          --output text \
-          --region ${{ env.AWS_REGION }})
+        aws autoscaling start-instance-refresh --auto-scaling-group-name ${{ secrets.ASG_NAME }}
 
-        for INSTANCE_ID in $INSTANCE_IDS; do
-          # Get the public IP of the instance
-          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
-            --query "Reservations[0].Instances[0].PublicIpAddress" \
-            --output text \
-            --region ${{ env.AWS_REGION }})
-
-          echo "Deploying to instance $INSTANCE_ID with IP $PUBLIC_IP"
-
-          # Download the package and wp-config.php
-          ssh -i /tmp/key.pem -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP \
-          "aws s3 cp s3://${{ env.PUBLIC_S3_BUCKET }}/app_$(date +%Y%m%d).tar.gz /tmp/ && \
-           aws s3 cp s3://${{ env.PRIVATE_S3_BUCKET }}/wp-config.php /tmp/ && \
-           sudo tar -xzf /tmp/app_$(date +%Y%m%d).tar.gz -C /var/www/html && \
-           sudo mv /tmp/wp-config.php /var/www/html/wp-config.php && \
-           sudo chown -R apache:apache /var/www/html && \
-           sudo chmod -R 755 /var/www/html && \
-           sudo systemctl restart httpd"
+    - name: Clean old builds from S3
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+      run: |
+        aws s3 ls s3://${{ secrets.S3_BUCKET_PUBLIC }}/ | awk '{print $4}' | while read file; do
+          if [[ $file == app_*.tar.gz ]]; then
+            build_date=$(echo $file | sed 's/app_\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).tar.gz/\1/')
+            build_timestamp=$(date -d $build_date +%s)
+            current_timestamp=$(date +%s)
+            diff=$(( (current_timestamp - build_timestamp) / 86400 ))
+            if [[ $diff -gt 7 ]]; then
+              aws s3 rm s3://${{ secrets.S3_BUCKET_PUBLIC }}/$file
+            fi
+          fi
         done
